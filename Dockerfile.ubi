@@ -1,19 +1,23 @@
 # --------------------------------------------------------------------------- #
 # Dockerfile.ubi — triton-sigmoid (GPU kernel library, job/CLI container)
-# Base: NVIDIA CUDA 12.8 devel on UBI9 (Triton needs PTX/SASS at runtime)
-# --------------------------------------------------------------------------- #
-# Optimised for constrained OpenShift build environments:
-#   - Each large pip install in its own layer with immediate cache cleanup
-#   - torch installed alone (huge wheel) to keep peak disk low
-#   - --no-cache-dir everywhere to avoid doubling disk usage
+#
+# FIX for OOM build failure: switched from cuda:12.8.0-devel-ubi9 (~5 GB) to
+# cuda:12.6.3-base-ubi9 (~300 MB). Triton JIT-compiles PTX at RUNTIME on GPU
+# nodes, so the build itself needs no CUDA dev headers. This dramatically
+# reduces build-time disk and memory pressure on constrained OpenShift pods.
+#
+# The "base" CUDA image provides the minimal CUDA runtime libraries; Triton
+# ships its own bundled CUDA compiler (ptxas) inside its Python wheel, so
+# the devel image is NOT required.
 # --------------------------------------------------------------------------- #
 
-FROM nvcr.io/nvidia/cuda:12.8.0-devel-ubi9
+FROM nvcr.io/nvidia/cuda:12.6.3-base-ubi9
 
 USER 0
 
 # ---- System dependencies -------------------------------------------------- #
-# Install Python 3.12 and minimal build tools in one layer.
+# Python 3.12, pip, and minimal C toolchain for any native extensions.
+# Single layer, aggressive cleanup.
 RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
         python3.12 \
         python3.12-pip \
@@ -23,22 +27,23 @@ RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/log/dnf* /var/log/hawkey*
 
-# Ensure python3 / pip3 point to 3.12
+# Make python3 / pip3 point to 3.12
 RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
-# Upgrade pip/setuptools/wheel in a slim layer before heavy installs
+# Upgrade core packaging tools (small layer)
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 WORKDIR /opt/app-root/src
 
-# ---- Install torch first (largest dep, ~2.5 GB) in its own layer --------- #
-# Separate layer avoids pip resolver loading all project deps at once.
-# Using --index-url (not --extra-index-url) so pip resolves ONLY from the
-# PyTorch CUDA wheel index for this step — much faster, no PyPI round-trips.
+# ---- Install torch (largest dep) in its own layer ------------------------ #
+# Use --extra-index-url so pip can still reach PyPI for torch's own deps
+# (e.g. filelock, sympy) while pulling the CUDA wheel from the PyTorch index.
+# Pinning to a specific version avoids pip's resolver scanning many candidates
+# which burns memory; 2.6.0+cu126 is compatible with CUDA 12.6 base.
 RUN python3 -m pip install --no-cache-dir \
-        "torch>=2.6.0" \
-        --index-url https://download.pytorch.org/whl/cu128 \
+        "torch==2.6.0" \
+        --extra-index-url https://download.pytorch.org/whl/cu126 \
     && rm -rf /tmp/pip-* /root/.cache
 
 # ---- Install triton in its own layer ------------------------------------- #
@@ -47,10 +52,11 @@ RUN python3 -m pip install --no-cache-dir \
     && rm -rf /tmp/pip-* /root/.cache
 
 # ---- Copy project source and install the library ------------------------- #
-COPY . .
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ src/
 
-# Install the project (numpy, pandas come from pyproject.toml dependencies).
-# torch and triton are already satisfied from previous layers.
+# --no-deps: torch, triton already installed; install only the project itself
+# then install remaining light deps (numpy, pandas) separately.
 RUN python3 -m pip install --no-cache-dir --no-deps . \
     && python3 -m pip install --no-cache-dir numpy pandas \
     && rm -rf /tmp/pip-* /root/.cache
@@ -62,6 +68,6 @@ USER 1001
 
 # Job / CLI container — no EXPOSE
 ENTRYPOINT ["python3"]
-# NOTE: triton_sigmoid.__init__ requires CUDA at import time, so we only
-# verify the supporting stack here; full import happens on a GPU node.
+# NOTE: triton_sigmoid.__init__ requires CUDA at import time, so we verify
+# the supporting stack here; full import happens on a GPU node at job time.
 CMD ["-c", "import torch; print(f'triton-sigmoid v0.1.1 ready  |  PyTorch {torch.__version__}  |  CUDA available: {torch.cuda.is_available()}')"]
