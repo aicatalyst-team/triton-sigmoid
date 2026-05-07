@@ -1,14 +1,9 @@
 # --------------------------------------------------------------------------- #
 # Dockerfile.ubi — triton-sigmoid (GPU kernel library, job/CLI container)
 #
-# FIX for OOM build failure: switched from cuda:12.8.0-devel-ubi9 (~5 GB) to
-# cuda:12.6.3-base-ubi9 (~300 MB). Triton JIT-compiles PTX at RUNTIME on GPU
-# nodes, so the build itself needs no CUDA dev headers. This dramatically
-# reduces build-time disk and memory pressure on constrained OpenShift pods.
-#
-# The "base" CUDA image provides the minimal CUDA runtime libraries; Triton
-# ships its own bundled CUDA compiler (ptxas) inside its Python wheel, so
-# the devel image is NOT required.
+# Base: cuda:12.6.3-base-ubi9 (~300 MB). Triton JIT-compiles PTX at RUNTIME
+# on GPU nodes, so the build itself needs no CUDA dev headers. Triton ships
+# its own bundled CUDA compiler (ptxas) inside its Python wheel.
 # --------------------------------------------------------------------------- #
 
 FROM nvcr.io/nvidia/cuda:12.6.3-base-ubi9
@@ -17,7 +12,6 @@ USER 0
 
 # ---- System dependencies -------------------------------------------------- #
 # Python 3.12, pip, and minimal C toolchain for any native extensions.
-# Single layer, aggressive cleanup.
 RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
         python3.12 \
         python3.12-pip \
@@ -31,16 +25,14 @@ RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
 RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
-# Upgrade core packaging tools (small layer)
+# Upgrade core packaging tools
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 WORKDIR /opt/app-root/src
 
 # ---- Install torch (largest dep) in its own layer ------------------------ #
 # Use --extra-index-url so pip can still reach PyPI for torch's own deps
-# (e.g. filelock, sympy) while pulling the CUDA wheel from the PyTorch index.
-# Pinning to a specific version avoids pip's resolver scanning many candidates
-# which burns memory; 2.6.0+cu126 is compatible with CUDA 12.6 base.
+# while pulling the CUDA wheel from the PyTorch index.
 RUN python3 -m pip install --no-cache-dir \
         "torch==2.6.0" \
         --extra-index-url https://download.pytorch.org/whl/cu126 \
@@ -52,6 +44,7 @@ RUN python3 -m pip install --no-cache-dir \
     && rm -rf /tmp/pip-* /root/.cache
 
 # ---- Copy project source and install the library ------------------------- #
+# NOTE: LICENSE was previously excluded by .dockerignore — that has been fixed.
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ src/
 
@@ -68,6 +61,4 @@ USER 1001
 
 # Job / CLI container — no EXPOSE
 ENTRYPOINT ["python3"]
-# NOTE: triton_sigmoid.__init__ requires CUDA at import time, so we verify
-# the supporting stack here; full import happens on a GPU node at job time.
 CMD ["-c", "import torch; print(f'triton-sigmoid v0.1.1 ready  |  PyTorch {torch.__version__}  |  CUDA available: {torch.cuda.is_available()}')"]
