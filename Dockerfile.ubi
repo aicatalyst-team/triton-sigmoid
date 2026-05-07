@@ -1,17 +1,15 @@
 # --------------------------------------------------------------------------- #
 # Dockerfile.ubi — triton-sigmoid (GPU kernel library, job/CLI container)
 #
-# Base: cuda:12.6.3-base-ubi9 (~300 MB). Triton JIT-compiles PTX at RUNTIME
-# on GPU nodes, so the build itself needs no CUDA dev headers. Triton ships
-# its own bundled CUDA compiler (ptxas) inside its Python wheel.
+# Base: cuda:12.8.0-devel-ubi9 — devel variant supplies CUDA toolkit
+# (ptxas, nvcc headers) that Triton needs for JIT-compiling GPU kernels.
 # --------------------------------------------------------------------------- #
 
-FROM nvcr.io/nvidia/cuda:12.6.3-base-ubi9
+FROM nvcr.io/nvidia/cuda:12.8.0-devel-ubi9
 
 USER 0
 
 # ---- System dependencies -------------------------------------------------- #
-# Python 3.12, pip, and minimal C toolchain for any native extensions.
 RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
         python3.12 \
         python3.12-pip \
@@ -21,7 +19,7 @@ RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/log/dnf* /var/log/hawkey*
 
-# Make python3 / pip3 point to 3.12
+# Make python3 / pip point to 3.12
 RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
@@ -30,29 +28,25 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 WORKDIR /opt/app-root/src
 
-# ---- Install torch (largest dep) in its own layer ------------------------ #
-# Use --extra-index-url so pip can still reach PyPI for torch's own deps
-# while pulling the CUDA wheel from the PyTorch index.
+# ---- Install torch (largest dep) — separate layer for caching ------------ #
+# --extra-index-url keeps PyPI available for torch's sub-dependencies while
+# pulling the CUDA 12.8 wheel from the PyTorch index.
 RUN python3 -m pip install --no-cache-dir \
-        "torch==2.6.0" \
-        --extra-index-url https://download.pytorch.org/whl/cu126 \
-    && rm -rf /tmp/pip-* /root/.cache
+        "torch>=2.6.0" \
+        --extra-index-url https://download.pytorch.org/whl/cu128
 
-# ---- Install triton in its own layer ------------------------------------- #
+# ---- Install triton — separate layer for caching ------------------------- #
 RUN python3 -m pip install --no-cache-dir \
-        "triton>=3.2.0" \
-    && rm -rf /tmp/pip-* /root/.cache
+        "triton>=3.2.0"
 
 # ---- Copy project source and install the library ------------------------- #
-# NOTE: LICENSE was previously excluded by .dockerignore — that has been fixed.
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ src/
 
-# --no-deps: torch, triton already installed; install only the project itself
-# then install remaining light deps (numpy, pandas) separately.
+# Install the project itself (--no-deps: torch/triton already installed)
+# then install remaining light deps separately.
 RUN python3 -m pip install --no-cache-dir --no-deps . \
-    && python3 -m pip install --no-cache-dir numpy pandas \
-    && rm -rf /tmp/pip-* /root/.cache
+    && python3 -m pip install --no-cache-dir numpy pandas
 
 # ---- OpenShift: group-0 permissions for arbitrary UID --------------------- #
 RUN chgrp -R 0 /opt/app-root && chmod -R g=u /opt/app-root
@@ -61,4 +55,7 @@ USER 1001
 
 # Job / CLI container — no EXPOSE
 ENTRYPOINT ["python3"]
-CMD ["-c", "import torch; print(f'triton-sigmoid v0.1.1 ready  |  PyTorch {torch.__version__}  |  CUDA available: {torch.cuda.is_available()}')"]
+# NOTE: triton_sigmoid.__init__ requires a CUDA GPU at import time, so the
+# default CMD only verifies torch is installed. On a GPU node, pass:
+#   -c "import triton_sigmoid; print('ok')"
+CMD ["-c", "import torch; print(f'triton-sigmoid container ready  |  PyTorch {torch.__version__}  |  CUDA available: {torch.cuda.is_available()}')"]
